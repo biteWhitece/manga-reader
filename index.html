@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>mangaread</title>
+    
+    <!-- PWA 配置：支持 iPad 添加到主屏幕 -->
+    <link rel="manifest" href='data:application/manifest+json,{"name":"mangaread","short_name":"mangaread","start_url":".","display":"standalone","background_color":"#050505","theme_color":"#050505","icons":[{"src":"https://raw.githubusercontent.com/lucide-react/lucide/main/icons/book-open.png","sizes":"192x192","type":"image/png"}]}'>
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="mangaread">
+    <link rel="apple-touch-icon" href="https://raw.githubusercontent.com/lucide-react/lucide/main/icons/book-open.png">
+
+    <!-- 核心库加载 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" crossorigin></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js" crossorigin></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
+        :root { --sat: env(safe-area-inset-top); --sar: env(safe-area-inset-right); --sab: env(safe-area-inset-bottom); --sal: env(safe-area-inset-left); }
+        body { 
+            font-family: 'Inter', sans-serif; 
+            background-color: #050505; 
+            color: white; 
+            margin: 0; 
+            overscroll-behavior: none; 
+            -webkit-tap-highlight-color: transparent; 
+            user-select: none; 
+            -webkit-user-select: none; 
+        }
+        
+        /* 屏蔽 iPad 图片长按菜单 */
+        img { -webkit-touch-callout: none !important; pointer-events: none; }
+        .img-container { -webkit-touch-callout: none !important; }
+
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .drag-handle-line { width: 2px; height: 24px; background-color: rgba(255,255,255,0.3); border-radius: 99px; }
+        .shelf-nav { padding-top: calc(1rem + var(--sat)); }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .animate-fade-in { animation: fadeIn 0.3s ease-out forwards; }
+        .page-group { gap: 0 !important; cursor: pointer; }
+        .progress-fill { transition: width 0.6s cubic-bezier(0.22, 1, 0.36, 1); }
+        .search-input-container { transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.2s ease; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+        // --- 本地数据库配置 ---
+        const DB_NAME = 'ComicReader_App_v15';
+        const STORE_FILES = 'pdf_blobs';
+        const STORE_META = 'book_records';
+
+        const openDB = () => {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open(DB_NAME, 1);
+                request.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains(STORE_FILES)) db.createObjectStore(STORE_FILES);
+                    if (!db.objectStoreNames.contains(STORE_META)) db.createObjectStore(STORE_META);
+                };
+                request.onsuccess = (e) => resolve(e.target.result);
+                request.onerror = (e) => reject(e.target.error);
+            });
+        };
+
+        const saveToLocal = async (storeName, id, data) => {
+            const dbRef = await openDB();
+            return new Promise((resolve, reject) => {
+                const tx = dbRef.transaction(storeName, 'readwrite');
+                tx.objectStore(storeName).put(data, id);
+                tx.oncomplete = () => resolve();
+                tx.onerror = (e) => reject(e.target.error);
+            });
+        };
+
+        const getFromLocal = async (storeName, id) => {
+            const dbRef = await openDB();
+            return new Promise((resolve) => {
+                const tx = dbRef.transaction(storeName, 'readonly');
+                const req = tx.objectStore(storeName).get(id);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => resolve(null);
+            });
+        };
+
+        const getAllLocal = async (storeName) => {
+            const dbRef = await openDB();
+            return new Promise((resolve) => {
+                const tx = dbRef.transaction(storeName, 'readonly');
+                const req = tx.objectStore(storeName).getAll();
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => resolve([]);
+            });
+        };
+
+        const deleteFromLocal = async (id) => {
+            const dbRef = await openDB();
+            const tx = dbRef.transaction([STORE_FILES, STORE_META], 'readwrite');
+            tx.objectStore(STORE_FILES).delete(id);
+            tx.objectStore(STORE_META).delete(id);
+            return new Promise(r => tx.oncomplete = r);
+        };
+
+        function App() {
+            const [books, setBooks] = useState([]);
+            const [view, setView] = useState('shelf');
+            const [isSelectMode, setIsSelectMode] = useState(false);
+            const [selectedIds, setSelectedIds] = useState([]);
+            const [loading, setLoading] = useState(false);
+            const [progress, setProgress] = useState(0);
+            const [sortMode, setSortMode] = useState('time');
+            const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+
+            // 搜索状态
+            const [searchQuery, setSearchQuery] = useState('');
+            const [isSearchOpen, setIsSearchOpen] = useState(false);
+
+            // 阅读器深度状态
+            const [currentBookId, setCurrentBookId] = useState(null);
+            const [pdfDoc, setPdfDoc] = useState(null);
+            const [thumbnails, setThumbnails] = useState([]);
+            const [highResCache, setHighResCache] = useState({});
+            const [layout, setLayout] = useState([]);
+            const [startIndex, setStartIndex] = useState(0);
+            
+            // 交互状态
+            const [isNavOpen, setIsNavOpen] = useState(false);
+            const [showBackHint, setShowBackHint] = useState(false);
+            const [showNavHint, setShowNavHint] = useState(false);
+            const [readerContextMenu, setReaderContextMenu] = useState(null);
+
+            const scrollRef = useRef(null);
+            const pageRefs = useRef([]);
+            const swipeStartX = useRef(null);
+            const splitGestureRef = useRef({ startY: null, groupIdx: null, isHoldActive: false, holdTimer: null });
+
+            useEffect(() => {
+                window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                refreshLibrary();
+            }, []);
+
+            const refreshLibrary = async () => {
+                const data = await getAllLocal(STORE_META);
+                setBooks(data);
+            };
+
+            const renderPage = async (pdf, pageNum, scale = 0.5) => {
+                try {
+                    const page = await pdf.getPage(pageNum);
+                    const viewport = page.getViewport({ scale });
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d', { alpha: false });
+                    canvas.height = viewport.height; canvas.width = viewport.width;
+                    await page.render({ canvasContext: ctx, viewport }).promise;
+                    return canvas.toDataURL('image/jpeg', scale > 1 ? 0.85 : 0.6);
+                } catch (e) { return null; }
+            };
+
+            const handleImport = async (e) => {
+                const files = Array.from(e.target.files);
+                if (files.length === 0) return;
+                setLoading(true);
+                for (let i = 0; i < files.length; i++) {
+                    const file = files[i];
+                    setProgress(Math.round(((i + 1) / files.length) * 100));
+                    try {
+                        const buffer = await file.arrayBuffer();
+                        const id = crypto.randomUUID ? crypto.randomUUID() : `b_${Date.now()}_${i}`;
+                        await saveToLocal(STORE_FILES, id, buffer);
+                        const pdf = await window.pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+                        const cover = await renderPage(pdf, 1, 0.4);
+                        
+                        // 寻找旧备份进度
+                        const oldMeta = books.find(b => b.title === file.name.replace('.pdf', ''));
+                        const initialLayout = oldMeta ? JSON.parse(oldMeta.layout) : Array.from({ length: pdf.numPages }, (_, k) => [k]);
+                        
+                        const meta = {
+                            id, title: file.name.replace('.pdf', ''), totalPages: pdf.numPages, coverUrl: cover,
+                            lastReadIndex: oldMeta ? oldMeta.lastReadIndex : 0, 
+                            layout: JSON.stringify(initialLayout),
+                            createdAt: { seconds: Date.now() / 1000 },
+                            lastReadTime: oldMeta ? oldMeta.lastReadTime : 0
+                        };
+                        await saveToLocal(STORE_META, id, meta);
+                        await pdf.destroy();
+                    } catch (err) { console.error(err); }
+                }
+                await refreshLibrary();
+                setLoading(false); e.target.value = '';
+            };
+
+            const openReader = async (book) => {
+                setLoading(true); setThumbnails([]); setHighResCache({});
+                try {
+                    const data = await getFromLocal(STORE_FILES, book.id);
+                    if (data) {
+                        const pdf = await window.pdfjsLib.getDocument({ data: new Uint8Array(data) }).promise;
+                        setPdfDoc(pdf);
+                        setLayout(JSON.parse(book.layout));
+                        setCurrentBookId(book.id);
+                        setStartIndex(book.lastReadIndex || 0);
+                        await updateMetaInStorageForBook(book.id, { lastReadTime: Date.now() });
+                        const thumbs = [];
+                        for(let i=1; i<=pdf.numPages; i++) thumbs.push(await renderPage(pdf, i, 0.25));
+                        setThumbnails(thumbs); setView('reader');
+                    }
+                } catch(e) { console.error(e); } finally { setLoading(false); }
+            };
+
+            const updateMetaInStorageForBook = async (id, update) => {
+                const meta = await getFromLocal(STORE_META, id);
+                if(meta) await saveToLocal(STORE_META, id, { ...meta, ...update });
+            };
+
+            useEffect(() => {
+                if (view === 'reader' && pdfDoc && thumbnails.length > 0) {
+                    const range = [startIndex, startIndex + 1, startIndex - 1];
+                    range.forEach(async (idx) => {
+                        if (idx >= 0 && idx < thumbnails.length && !highResCache[idx]) {
+                            const hr = await renderPage(pdfDoc, idx + 1, 1.8);
+                            if (hr) setHighResCache(prev => ({ ...prev, [idx]: hr }));
+                        }
+                    });
+                }
+            }, [view, pdfDoc, startIndex, thumbnails.length]);
+
+            const handleMerge = async (idx, dir) => {
+                let newL = [...layout];
+                let gA = newL.find(g => g.includes(idx));
+                let gB = newL.find(g => g.includes(idx + dir));
+                if (!gA || !gB || gA === gB) return;
+                const merged = Array.from(new Set([...gA, ...gB])).sort((a, b) => a - b);
+                const filtered = newL.filter(g => g !== gA && g !== gB);
+                const pos = Math.min(newL.indexOf(gA), newL.indexOf(gB));
+                filtered.splice(pos, 0, merged);
+                setLayout(filtered); setReaderContextMenu(null);
+                await updateMetaInStorageForBook(currentBookId, { layout: JSON.stringify(filtered) });
+            };
+
+            const handleSwapOrder = async (groupIdx) => {
+                const newL = [...layout];
+                if (!newL[groupIdx] || newL[groupIdx].length <= 1) return;
+                newL[groupIdx] = [...newL[groupIdx]].reverse();
+                setLayout(newL);
+                await updateMetaInStorageForBook(currentBookId, { layout: JSON.stringify(newL) });
+            };
+
+            const handleSplit = async (groupIdx) => {
+                const newL = [...layout];
+                const group = newL[groupIdx];
+                if (!group || group.length <= 1) return;
+                const split = group.map(p => [p]).sort((a,b)=>a[0]-b[0]);
+                newL.splice(groupIdx, 1, ...split);
+                setLayout(newL);
+                await updateMetaInStorageForBook(currentBookId, { layout: JSON.stringify(newL) });
+            };
+
+            const exitReader = async () => {
+                if (currentBookId) await updateMetaInStorageForBook(currentBookId, { lastReadIndex: startIndex });
+                if (pdfDoc) await pdfDoc.destroy();
+                setPdfDoc(null); setView('shelf'); refreshLibrary(); setIsNavOpen(false);
+            };
+
+            const exportProgress = async () => {
+                const allMeta = await getAllLocal(STORE_META);
+                const exportData = allMeta.map(({id, title, totalPages, lastReadIndex, layout, lastReadTime}) => ({
+                    id, title, totalPages, lastReadIndex, layout, lastReadTime
+                }));
+                const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'mangareader-jindu.json';
+                a.click();
+                URL.revokeObjectURL(url);
+                setSettingsMenuOpen(false);
+            };
+
+            const importProgress = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = async (event) => {
+                    try {
+                        const data = JSON.parse(event.target.result);
+                        for (const item of data) {
+                            const existing = books.find(b => b.title === item.title);
+                            if (existing) {
+                                await updateMetaInStorageForBook(existing.id, {
+                                    lastReadIndex: item.lastReadIndex,
+                                    layout: item.layout,
+                                    lastReadTime: item.lastReadTime || 0
+                                });
+                            } else {
+                                await saveToLocal(STORE_META, item.id, item);
+                            }
+                        }
+                        await refreshLibrary();
+                        alert('进度导入成功！导入 PDF 文件后将自动匹配进度。');
+                    } catch (err) {
+                        alert('导入失败，请检查文件格式。');
+                    }
+                };
+                reader.readAsText(file);
+                setSettingsMenuOpen(false);
+                e.target.value = '';
+            };
+
+            const filteredBooks = useMemo(() => {
+                let result = [...books];
+                if (searchQuery.trim()) {
+                    result = result.filter(b => b.title.toLowerCase().includes(searchQuery.toLowerCase()));
+                }
+                return result.sort((a, b) => {
+                    if (sortMode === 'name') return a.title.localeCompare(b.title);
+                    return (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0);
+                });
+            }, [books, searchQuery, sortMode]);
+
+            const recentBooks = useMemo(() => {
+                return books.filter(b => b.lastReadTime && b.lastReadTime > 0).sort((a, b) => b.lastReadTime - a.lastReadTime).slice(0, 6);
+            }, [books]);
+
+            return (
+                <div className="min-h-screen bg-[#050505] animate-fade-in flex flex-col">
+                    {view === 'shelf' ? (
+                        <div className="flex-1 overflow-y-auto no-scrollbar">
+                            <nav className="sticky top-0 z-40 bg-zinc-950/80 backdrop-blur-2xl border-b border-white/5 shelf-nav px-6 pb-4 flex justify-between items-center shadow-xl">
+                                <div className="flex items-center gap-4">
+                                    <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center font-black text-[10px]">HD</div>
+                                    {!isSearchOpen && <h1 className="text-sm font-black uppercase tracking-widest">mangaread</h1>}
+                                </div>
+                                <div className="flex items-center gap-3">
+                                    <div className={`flex items-center bg-zinc-900 border border-white/10 rounded-full overflow-hidden search-input-container ${isSearchOpen ? 'w-48 px-3 opacity-100' : 'w-0 opacity-0 px-0 border-none'}`}>
+                                        <input type="text" placeholder="搜索..." className="bg-transparent border-none outline-none text-[10px] font-bold w-full text-white py-1.5" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} />
+                                    </div>
+                                    <button onClick={() => { setIsSearchOpen(!isSearchOpen); if(isSearchOpen) setSearchQuery(''); }} className={`w-10 h-10 rounded-full flex items-center justify-center transition-all ${isSearchOpen ? 'bg-blue-600 text-white' : 'bg-zinc-900 border border-white/10 text-zinc-400'}`}>
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+                                    </button>
+                                    <button onClick={() => { setIsSelectMode(!isSelectMode); setSelectedIds([]); }} className={`h-10 px-4 rounded-full text-[10px] font-black uppercase transition-all ${isSelectMode ? 'bg-blue-600 shadow-lg' : 'bg-zinc-900 border border-white/10 text-zinc-400'}`}>
+                                        {isSelectMode ? '完成' : '选择'}
+                                    </button>
+                                    
+                                    <button onClick={() => setSettingsMenuOpen(!settingsMenuOpen)} className="w-10 h-10 rounded-full bg-zinc-900 border border-white/10 text-zinc-400 flex items-center justify-center">
+                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                                    </button>
+
+                                    <label className="h-10 px-5 rounded-full flex items-center justify-center font-bold text-[10px] uppercase cursor-pointer bg-white text-black active:scale-95 shadow-xl transition-all">
+                                        导入
+                                        <input type="file" multiple accept=".pdf" className="hidden" onChange={handleImport} />
+                                    </label>
+                                </div>
+
+                                {settingsMenuOpen && (
+                                    <div className="absolute top-24 right-32 z-50 bg-zinc-900 border border-white/10 rounded-2xl p-2 w-48 shadow-2xl animate-fade-in" onClick={e => e.stopPropagation()}>
+                                        <div className="px-3 py-2 text-[8px] font-black text-zinc-600 uppercase border-b border-white/5 mb-1 tracking-widest">漫画排序</div>
+                                        <button onClick={() => { setSortMode('time'); setSettingsMenuOpen(false); }} className={`w-full text-left px-4 py-3 text-xs font-bold rounded-xl ${sortMode === 'time' ? 'bg-blue-600 text-white' : 'text-zinc-400 hover:bg-white/5'}`}>按上传时间</button>
+                                        <button onClick={() => { setSortMode('name'); setSettingsMenuOpen(false); }} className={`w-full text-left px-4 py-3 text-xs font-bold rounded-xl ${sortMode === 'name' ? 'bg-blue-600 text-white' : 'text-zinc-400 hover:bg-white/5'}`}>按文件名称</button>
+                                        <div className="px-3 py-2 text-[8px] font-black text-zinc-600 uppercase border-b border-white/5 my-1 tracking-widest">备份与还原</div>
+                                        <button onClick={exportProgress} className="w-full text-left px-4 py-3 text-xs font-bold text-blue-400 rounded-xl hover:bg-white/5">导出阅读进度</button>
+                                        <label className="w-full text-left px-4 py-3 text-xs font-bold text-emerald-400 rounded-xl hover:bg-white/5 block cursor-pointer">
+                                            导入阅读进度
+                                            <input type="file" accept=".json" className="hidden" onChange={importProgress} />
+                                        </label>
+                                    </div>
+                                )}
+                            </nav>
+
+                            {recentBooks.length > 0 && !searchQuery && (
+                                <section className="max-w-screen-xl mx-auto px-6 mt-10">
+                                    <h2 className="text-[10px] font-black uppercase tracking-[0.2em] text-zinc-500 mb-4">最近阅读</h2>
+                                    <div className="flex gap-4 overflow-x-auto no-scrollbar pb-4">
+                                        {recentBooks.map(item => (
+                                            <div key={`recent-${item.id}`} className="flex-shrink-0 w-24 active:scale-95 transition-transform" onClick={() => openReader(item)}>
+                                                <div className="relative aspect-[3/4] rounded-lg overflow-hidden border border-white/10 shadow-lg bg-zinc-900">
+                                                    {item.coverUrl ? <img src={item.coverUrl} className="w-full h-full object-cover" /> : <div className="w-full h-full flex items-center justify-center opacity-10 font-bold text-[8px]">PDF</div>}
+                                                    <div className="absolute bottom-0 left-0 w-full h-1 bg-black/40">
+                                                        <div className="h-full bg-blue-500" style={{ width: `${Math.round(((item.lastReadIndex || 0) + 1) / item.totalPages * 100)}%` }} />
+                                                    </div>
+                                                </div>
+                                                <h3 className="text-[9px] font-bold mt-2 truncate text-zinc-400">{item.title}</h3>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </section>
+                            )}
+
+                            <main className="max-w-screen-xl mx-auto p-6 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-8 pb-32">
+                                {filteredBooks.map(item => {
+                                    const selected = selectedIds.includes(item.id);
+                                    const progressPct = item.totalPages ? Math.round(((item.lastReadIndex || 0) + 1) / item.totalPages * 100) : 0;
+                                    return (
+                                        <div key={item.id} className="group cursor-pointer active:scale-95 transition-all" onClick={() => {
+                                            if (isSelectMode) setSelectedIds(p => p.includes(item.id) ? p.filter(i=>i!==item.id) : [...p, item.id]);
+                                            else openReader(item);
+                                        }}>
+                                            <div className={`relative aspect-[3/4] mb-4 transition-all duration-500 ${selected ? 'scale-90' : 'group-hover:scale-105'}`}>
+                                                <div className={`w-full h-full rounded-2xl overflow-hidden bg-zinc-900 border ${selected ? 'border-blue-500 ring-4 ring-blue-500/30' : 'border-white/5'} shadow-2xl relative`}>
+                                                    {item.coverUrl ? <img src={item.coverUrl} className="w-full h-full object-cover" /> : <div className="w-full h-full flex items-center justify-center opacity-10 font-bold text-xs uppercase">暂无封面</div>}
+                                                    <div className="absolute bottom-0 left-0 w-full h-1.5 bg-black/40 backdrop-blur-sm overflow-hidden">
+                                                        <div className="h-full bg-blue-500 progress-fill" style={{ width: `${Math.min(100, progressPct)}%` }} />
+                                                    </div>
+                                                </div>
+                                                {isSelectMode && (
+                                                    <div className="absolute top-3 left-3 w-6 h-6 rounded-full border-2 border-white/50 bg-black/20 flex items-center justify-center transition-all shadow-lg">
+                                                        {selected && <div className="w-3 h-3 bg-blue-500 rounded-full" />}
+                                                    </div>
+                                                )}
+                                            </div>
+                                            <div className="flex justify-between items-start px-1">
+                                                <h3 className="font-bold text-xs truncate text-zinc-300 flex-1">{item.title}</h3>
+                                                <span className="text-[9px] font-black text-zinc-500 ml-2">{progressPct}%</span>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </main>
+                        </div>
+                    ) : (
+                        <div className="fixed inset-0 z-[100] bg-black flex flex-row overflow-hidden">
+                            {isNavOpen && (
+                                <div className="h-full w-32 flex-shrink-0 z-[150] bg-zinc-950/40 backdrop-blur-3xl border-r border-white/5 flex flex-col no-scrollbar">
+                                    <div className="w-full h-16 flex items-center justify-center cursor-ew-resize" onMouseDown={e => { swipeStartX.current = e.clientX; }} onMouseMove={e => { if(e.buttons === 1 && swipeStartX.current - e.clientX > 40) setIsNavOpen(false); }} onTouchStart={e => { swipeStartX.current = e.touches[0].clientX; }} onTouchMove={e => { if(swipeStartX.current - e.touches[0].clientX > 40) setIsNavOpen(false); }}>
+                                        <div className="flex gap-1.5 opacity-30"><div className="drag-handle-line"></div><div className="drag-handle-line"></div><div className="drag-handle-line"></div></div>
+                                    </div>
+                                    <div className="flex-1 overflow-y-auto px-4 pb-12 space-y-5 no-scrollbar">
+                                        {thumbnails.map((thumb, idx) => (
+                                            <div key={idx} onClick={() => pageRefs.current[idx]?.scrollIntoView()} className={`aspect-[3/4] rounded-xl overflow-hidden border-2 ${startIndex === idx ? 'border-blue-500 scale-105 shadow-xl' : 'border-white/5'}`}>
+                                                <img src={thumb} className="w-full h-full object-cover" />
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+
+                            <div className={`flex-1 relative h-full overflow-hidden transition-all duration-500 ${isNavOpen ? 'pl-6' : 'pl-0'}`} onClick={() => setReaderContextMenu(null)}>
+                                <div className="fixed top-0 left-0 w-32 h-32 z-[130] cursor-pointer" onDoubleClick={exitReader} onClick={() => { setShowBackHint(true); setTimeout(()=>setShowBackHint(false), 2000); }}>
+                                    {showBackHint && <div className="absolute top-10 left-10 bg-black/60 p-4 rounded-2xl border border-white/10 text-[10px] font-black uppercase tracking-tighter shadow-2xl text-center">双击退出阅读</div>}
+                                </div>
+                                <div className="fixed bottom-0 left-0 w-32 h-32 z-[130] cursor-pointer" onDoubleClick={() => setIsNavOpen(!isNavOpen)} onClick={() => { setShowNavHint(true); setTimeout(()=>setShowNavHint(false), 2000); }}>
+                                    {showNavHint && <div className="absolute bottom-10 left-10 bg-black/60 p-4 rounded-2xl border border-white/10 text-[10px] font-black uppercase tracking-tighter shadow-2xl text-center">双击快速导航</div>}
+                                </div>
+
+                                <div className="w-full h-full overflow-y-auto no-scrollbar pb-32" onScroll={e => {
+                                    const rects = e.target.firstChild.children;
+                                    for(let i=0; i<rects.length; i++) {
+                                        const box = rects[i].getBoundingClientRect();
+                                        if(box.top >= 0 && box.top < 400) { if(layout[i]) setStartIndex(layout[i][0]); break; }
+                                    }
+                                }} ref={scrollRef}>
+                                    <div className="flex flex-col items-center max-w-4xl mx-auto">
+                                        {layout.map((group, groupIdx) => (
+                                            <div key={groupIdx} className={`w-full flex justify-center page-group ${group.length > 1 ? 'flex-row' : 'flex-col items-center'}`}
+                                                 onClick={(e) => { 
+                                                     e.stopPropagation(); 
+                                                     if (group.length > 1) handleSwapOrder(groupIdx);
+                                                     else setReaderContextMenu({ x: e.clientX, y: e.clientY, index: group[0] });
+                                                 }}
+                                                 onMouseDown={e => { splitGestureRef.current.holdTimer = setTimeout(() => { splitGestureRef.current.isHoldActive = true; }, 600); splitGestureRef.current.startY = e.clientY; }}
+                                                 onMouseMove={e => { if (splitGestureRef.current.isHoldActive && Math.abs(e.clientY - splitGestureRef.current.startY) > 80) { handleSplit(groupIdx); splitGestureRef.current.isHoldActive = false; clearTimeout(splitGestureRef.current.holdTimer); } }}
+                                                 onMouseUp={() => { clearTimeout(splitGestureRef.current.holdTimer); splitGestureRef.current.isHoldActive = false; }}
+                                                 onTouchStart={e => { splitGestureRef.current.holdTimer = setTimeout(() => { splitGestureRef.current.isHoldActive = true; }, 600); splitGestureRef.current.startY = e.touches[0].clientY; }}
+                                                 onTouchMove={e => { if (splitGestureRef.current.isHoldActive && Math.abs(e.touches[0].clientY - splitGestureRef.current.startY) > 100) { handleSplit(groupIdx); splitGestureRef.current.isHoldActive = false; clearTimeout(splitGestureRef.current.holdTimer); } }}
+                                                 onTouchEnd={() => { clearTimeout(splitGestureRef.current.holdTimer); splitGestureRef.current.isHoldActive = false; }}>
+                                                {group.map(pIdx => (
+                                                    <div key={pIdx} ref={el => pageRefs.current[pIdx] = el} className="relative w-full overflow-hidden img-container">
+                                                        <img src={highResCache[pIdx] || thumbnails[pIdx]} className={`w-full h-auto object-contain transition-all duration-700 ${highResCache[pIdx] ? 'blur-0 opacity-100' : 'blur-lg opacity-40'}`} />
+                                                        <div className="absolute top-4 left-4 bg-black/40 px-2 py-0.5 rounded text-[8px] font-bold">P.{pIdx+1}</div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {readerContextMenu && (
+                                    <>
+                                        <div className="fixed inset-0 z-[190]" onClick={() => setReaderContextMenu(null)}></div>
+                                        <div className="fixed z-[200] bg-zinc-900 border border-white/10 rounded-2xl p-2 w-44 shadow-2xl" style={{ left: Math.min(readerContextMenu.x, window.innerWidth-180), top: Math.min(readerContextMenu.y, window.innerHeight-150) }}>
+                                            <button onClick={() => handleMerge(readerContextMenu.index, 1)} className="w-full text-left px-4 py-3 text-xs font-bold hover:bg-blue-600 rounded-xl transition-all">与后页合并</button>
+                                            <button onClick={() => handleMerge(readerContextMenu.index, -1)} className="w-full text-left px-4 py-3 text-xs font-bold hover:bg-blue-600 rounded-xl transition-all">与前页合并</button>
+                                            <button onClick={() => handleSplit(layout.findIndex(g=>g.includes(readerContextMenu.index)))} className="w-full text-left px-4 py-3 text-xs font-bold text-red-400 hover:bg-red-600/20 rounded-xl border-t border-white/5 mt-1 text-center">解开拼合</button>
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    {isSelectMode && selectedIds.length > 0 && (
+                        <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-[100] w-full max-w-md bg-zinc-900/90 backdrop-blur-xl border border-white/10 rounded-full p-4 flex justify-between items-center shadow-2xl">
+                            <span className="ml-4 font-black text-xs uppercase tracking-tighter">已选择 {selectedIds.length} 项</span>
+                            <div className="flex gap-2">
+                                <button onClick={() => { if(confirm(`确认删除这 ${selectedIds.length} 本漫画吗？`)) { selectedIds.forEach(id => deleteFromLocal(id)); setSelectedIds([]); setIsSelectMode(false); refreshLibrary(); } }} className="h-10 px-6 bg-red-600 text-white rounded-full font-bold text-xs uppercase shadow-lg">确认删除</button>
+                            </div>
+                        </div>
+                    )}
+
+                    {loading && (
+                        <div className="fixed bottom-10 right-10 z-[250] bg-blue-600 text-white p-6 rounded-3xl shadow-2xl flex flex-col gap-2 min-w-[220px]">
+                            <div className="flex justify-between text-[10px] font-black uppercase tracking-widest">
+                                <span>处理中...</span>
+                                <span>{progress}%</span>
+                            </div>
+                            <div className="h-1.5 bg-black/20 rounded-full overflow-hidden">
+                                <div className="h-full bg-white transition-all duration-300" style={{ width: `${progress}%` }} />
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
